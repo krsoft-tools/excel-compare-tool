@@ -354,8 +354,16 @@ async def export_excel(
             for c in row:
                 c.fill = red
         elif t == "replace":
-            for c in row:
-                c.fill = orange
+            for col_idx, c in enumerate(row):
+                val2 = c.value
+
+                if idx < len(df1) and col_idx < len(df1.columns):
+                    val1 = df1.iloc[idx, col_idx]
+                else:
+                    val1 = ""
+
+                if str(val1) != str(val2):
+                    c.fill = orange
 
     ws_changes = wb.create_sheet("changes")
 
