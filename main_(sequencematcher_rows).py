@@ -47,12 +47,6 @@ async def prepare_data(file1, file2, key):
     df1 = pd.read_excel(file1.file, engine="openpyxl").fillna("")
     df2 = pd.read_excel(file2.file, engine="openpyxl").fillna("")
 
-    for df in [df1, df2]:
-        for col in df.columns:
-            if "date" in str(col).lower():
-                df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
-                df[col] = df[col].fillna("")
-
     df1.columns = df1.columns.str.strip()
     df2.columns = df2.columns.str.strip()
 
@@ -206,6 +200,7 @@ def ui():
             <form method="post" enctype="multipart/form-data">
                 <input type="file" name="file1">
                 <input type="file" name="file2">
+                <input type="text" name="key" placeholder="Key column">
 
                 <button formaction="/export">Compare & Download Excel</button>
             </form>
@@ -283,36 +278,106 @@ async def export_excel(
     file1: UploadFile = File(...),
     file2: UploadFile = File(...)
 ):
+    print("NEW EXPORT CODE LOADED")
+
+    import difflib
     from io import BytesIO
     from openpyxl import load_workbook
     from openpyxl.styles import PatternFill
 
-    # načítanie súborov
+    # 👉 reset stream (KRITICKÉ)
+    content1 = await file1.read()
+    content2 = await file2.read()
+
+    # 👉 load
     df1 = pd.read_excel(file1.file, engine="openpyxl").fillna("")
     df2 = pd.read_excel(file2.file, engine="openpyxl").fillna("")
 
-    # remove junk columns
-    df1 = df1.loc[:, ~df1.columns.str.contains("^Unnamed")]
-    df2 = df2.loc[:, ~df2.columns.str.contains("^Unnamed")]
+    # 👉 clean columns
+    df1.columns = df1.columns.str.strip()
+    df2.columns = df2.columns.str.strip()
 
-    # unify size
-    max_rows = max(len(df1), len(df2))
-    max_cols = max(len(df1.columns), len(df2.columns))
+    df1 = df1.loc[:, ~df1.columns.str.contains('^Unnamed')]
+    df2 = df2.loc[:, ~df2.columns.str.contains('^Unnamed')]
 
-    df1 = df1.reindex(range(max_rows)).fillna("")
-    df2 = df2.reindex(range(max_rows)).fillna("")
+    # 👉 unify columns (DÔLEŽITÉ pre delete)
+    all_cols = list(df1.columns.union(df2.columns))
+    df1 = df1.reindex(columns=all_cols, fill_value="")
+    df2 = df2.reindex(columns=all_cols, fill_value="")
 
-    while len(df1.columns) < max_cols:
-        df1[f"extra_{len(df1.columns)}"] = ""
+    # 👉 datetime fix
+    for col in df1.columns:
+        if 'date' in col.lower():
+            df1[col] = pd.to_datetime(df1[col], errors='coerce').dt.strftime('%Y-%m-%d')
+    for col in df2.columns:
+        if 'date' in col.lower():
+            df2[col] = pd.to_datetime(df2[col], errors='coerce').dt.strftime('%Y-%m-%d')
 
-    while len(df2.columns) < max_cols:
-        df2[f"extra_{len(df2.columns)}"] = ""
+    # 👉 normalize
+    def normalize(val):
+        if pd.isna(val) or val == "":
+            return ""
+        try:
+            f = float(val)
+            if f.is_integer():
+                return str(int(f))
+            return str(f)
+        except:
+            return str(val).strip()
 
-    df1 = df1.fillna("")
-    df2 = df2.fillna("")
+    df1 = df1.apply(lambda col: col.map(normalize))
+    df2 = df2.apply(lambda col: col.map(normalize))
 
-    # output = file2 layout
-    result_df = df2.copy()
+    # 👉 rows to string
+    def row_to_str(row):
+        return "|".join([normalize(v) for v in row])
+
+    rows1 = [row_to_str(r) for r in df1.values]
+    rows2 = [row_to_str(r) for r in df2.values]
+
+    matcher = difflib.SequenceMatcher(None, rows1, rows2)
+
+    output_rows = []
+    row_types = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        print(tag, i1, i2, j1, j2)
+
+        if tag == "equal":
+            for i in range(i1, i2):
+                output_rows.append(df2.iloc[i].tolist())
+                row_types.append("equal")
+
+        elif tag == "replace":
+            len1 = i2 - i1
+            len2 = j2 - j1
+
+            # 👉 rovnaký počet = skutočný replace
+            if len1 == len2:
+                for k in range(len1):
+                    output_rows.append(df2.iloc[j1 + k].tolist())
+                    row_types.append("replace")
+            else:
+                # 👉 split na delete + insert
+                for i in range(i1, i2):
+                    output_rows.append(df1.iloc[i].tolist())
+                    row_types.append("delete")
+
+                for j in range(j1, j2):
+                    output_rows.append(df2.iloc[j].tolist())
+                    row_types.append("insert")
+
+        elif tag == "insert":
+            for j in range(j1, j2):
+                output_rows.append(df2.iloc[j].tolist())
+                row_types.append("insert")
+
+        elif tag == "delete":
+            for i in range(i1, i2):
+                output_rows.append(df1.iloc[i].tolist())
+                row_types.append("delete")
+
+    result_df = pd.DataFrame(output_rows, columns=all_cols)
 
     output = BytesIO()
 
@@ -325,16 +390,32 @@ async def export_excel(
     ws = wb["result"]
 
     orange = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+    green = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+    red = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid")
 
-    # compare cells
-    for r in range(max_rows):
-        for c in range(max_cols):
+    for idx, row in enumerate(ws.iter_rows(min_row=2), start=0):
+        t = row_types[idx]
 
-            val1 = str(df1.iloc[r, c]).strip()
-            val2 = str(df2.iloc[r, c]).strip()
+        if t == "insert":
+            for c in row:
+                c.fill = green
 
-            if val1 != val2:
-                ws.cell(row=r + 2, column=c + 1).fill = orange
+        elif t == "delete":
+            for c in row:
+                c.fill = red
+
+        elif t == "replace":
+            try:
+                original = rows1[idx].split("|")
+            except:
+                original = [""] * len(row)
+
+            for col_idx, c in enumerate(row):
+                val1 = original[col_idx] if col_idx < len(original) else ""
+                val2 = c.value if c.value is not None else ""
+
+                if str(val1) != str(val2):
+                    c.fill = orange
 
     final = BytesIO()
     wb.save(final)
